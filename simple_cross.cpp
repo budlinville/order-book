@@ -227,6 +227,7 @@ private:
   void _fillOrder(Order &order);
   void _fillBid(Order &order);
   void _fillAsk(Order &order);
+  void _validateOrderId(const OrderId orderId);
 
   std::vector<std::string> _splitLine(const std::string line, const char delim=' ');
 
@@ -258,6 +259,7 @@ results_t SimpleCross::action(const std::string line) {
 
 //----------------------------------------------------------------------------------------------------------------------
 void SimpleCross::_placeOrder(Order &order) {
+  _validateOrderId(order.oid);
   // Note: In a real system, all the traded symbols would probably be loaded on startup,
   //       but given the problem constraints, we will generate the book on the fly
   if (orderBook.find(order.symbol) == orderBook.end()) {
@@ -265,6 +267,8 @@ void SimpleCross::_placeOrder(Order &order) {
   } else {
     _placeOrderExistingSymbol(order);
   }
+
+  orderCache.insert(std::pair<OrderId, Order>(order.oid, order));
 }
 
 //----------------------------------------------------------------------------------------------------------------------
@@ -352,10 +356,12 @@ void SimpleCross::_fillBid(Order &order) {
   log("Attempting to fill bid!");
   // Already know symbol is in orderBook from calling function
   PriceLevels& askPxLevels = orderBook[order.symbol].asks;
+  std::vector<Price> pxLevelsToDrop = {};
 
   for (std::pair<Price, OrderQueue> aPxLevel : askPxLevels) {
     Price askPrice = aPxLevel.first;
     OrderQueue& askOrderQueue = aPxLevel.second;
+    int ordersToPop = 0;
 
     if (order.px >= askPrice) {
       for (Order& restingOrder : askOrderQueue) {
@@ -363,14 +369,20 @@ void SimpleCross::_fillBid(Order &order) {
         order.qty -= sharesExecuted;
         restingOrder.qty -= sharesExecuted;
 
-        if (restingOrder.qty == 0) askOrderQueue.pop_front();
+        if (restingOrder.qty == 0) ordersToPop++;
         if (order.qty == 0) break;
       }
 
-      if (askOrderQueue.empty()) askPxLevels.erase(askPrice);
-      if (order.qty == 0) break;
+      // Clear resting orders with zero shares left
+      for (int i=0; i < ordersToPop; i++) askOrderQueue.pop_back();
     }
+
+    if (askOrderQueue.empty()) pxLevelsToDrop.push_back(askPrice);
+    if (order.qty == 0) break;
   }
+
+  // Clear price levels for which there are no longer resting orders
+  for (Price px : pxLevelsToDrop) askPxLevels.erase(px);
 }
 
 //----------------------------------------------------------------------------------------------------------------------
@@ -378,25 +390,44 @@ void SimpleCross::_fillAsk(Order &order) {
   log("Attempting to fill ask!");
   // Already know symbol is in orderBook from calling function
   PriceLevels& bidPxLevels = orderBook[order.symbol].bids;
+  std::vector<Price> pxLevelsToDrop = {};
 
   // Iterate in reverse order because bidPxLevels.end() is most competitive price
-  for (auto pxlIt = bidPxLevels.rbegin(); pxlIt != bidPxLevels.rend(); ++pxlIt) {
-    Price bidPrice = pxlIt->first;
-    OrderQueue& bidOrderQueue = pxlIt->second;
+  for (auto pxLevelIt = bidPxLevels.rbegin(); pxLevelIt != bidPxLevels.rend(); ++pxLevelIt) {
+    log("a");
+    Price bidPrice = pxLevelIt->first;
+    OrderQueue& bidOrderQueue = pxLevelIt->second;
+    int ordersToPop = 0;
 
     if (order.px <= bidPrice) {
       log("Crossing order!");
       for (Order& restingOrder : bidOrderQueue) {
+        log("b");
         Quantity sharesExecuted = std::min(restingOrder.qty, order.qty);
         order.qty -= sharesExecuted;
         restingOrder.qty -= sharesExecuted;
 
-        if (restingOrder.qty == 0) bidOrderQueue.pop_front();
+        if (restingOrder.qty == 0) ordersToPop++;
         if (order.qty == 0) break;
       }
 
-      if (bidOrderQueue.empty()) bidPxLevels.erase(bidPrice);
-      if (order.qty == 0) break;
+      // Clear resting orders with zero shares left
+      for (int i=0; i < ordersToPop; i++) bidOrderQueue.pop_back();
+    }
+
+    if (bidOrderQueue.empty()) pxLevelsToDrop.push_back(bidPrice);
+    if (order.qty == 0) break;
+  }
+
+  // Clear price levels for which there are no longer resting orders
+  for (Price px : pxLevelsToDrop) bidPxLevels.erase(px);
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+void SimpleCross::_validateOrderId(const OrderId orderId) {
+  for (std::pair<OrderId, Order> cachedOrder : orderCache) {
+    if (cachedOrder.first == orderId) {
+      throw std::invalid_argument("Invalid Order ID");
     }
   }
 }
