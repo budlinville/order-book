@@ -170,7 +170,7 @@ typedef std::list<std::string> results_t;
 
 enum Action {
   PLACE = 'O',
-  CACNEL = 'X',
+  CANCEL = 'X',
   PRINT = 'P',
 };
 
@@ -191,6 +191,8 @@ struct Order {
   Quantity qty;
   Price px;
 
+  Order() : oid(0), symbol(""), side(Side::BUY), qty(0), px(0.0) {}
+
   Order(OrderId _oid, Symbol _symbol, Side _side, Quantity _qty, Price _px)
     : oid(_oid)
     , symbol(_symbol)
@@ -210,6 +212,8 @@ struct Sides { PriceLevels bids; PriceLevels asks; };
 typedef std::map<Symbol, Sides> OrderBook;
 typedef std::map<OrderId, Order> OrderCache;
 
+struct Fill { OrderId oid; Symbol symbol; Quantity qty; Price px; };
+
 //----------------------------------------------------------------------------------------------------------------------
 // Simple Cross Order Book Driver
 //----------------------------------------------------------------------------------------------------------------------
@@ -218,32 +222,36 @@ public:
   results_t action(const std::string line);
 
 private:
-  void _placeOrder(Order &order);
-  void _cancelOrder(OrderId oid);
+  std::vector<Fill> _placeOrder(Order &order);
+  bool _cancelOrder(OrderId oid);
   void _printSortedBook();
+  void _printFills(std::vector<Fill> fills);
+  void _printCancel(OrderId oid, bool cancelled);
 
   void _placeOrderNewSymbol(Order &order);
-  void _placeOrderExistingSymbol(Order &order);
-  void _fillOrder(Order &order);
-  void _fillBid(Order &order);
-  void _fillAsk(Order &order);
+  std::vector<Fill> _placeOrderExistingSymbol(Order &order);
+  std::vector<Fill> _fillOrder(Order &order);
+  std::vector<Fill> _fillBid(Order &order);
+  std::vector<Fill> _fillAsk(Order &order);
   void _validateOrderId(const OrderId orderId);
 
   std::vector<std::string> _splitLine(const std::string line, const char delim=' ');
 
   template<typename T> void _log(T t) { if (debug) { log(t); } }
+  void _logSortedBook();
 
 private:
   OrderBook orderBook;
   OrderCache orderCache;
   
-  bool debug = true;
+  bool debug = false;
 };
 
 //----------------------------------------------------------------------------------------------------------------------
 results_t SimpleCross::action(const std::string line) {
   std::vector<std::string> instructions = _splitLine(line);
-  if (instructions[0] == "O") {
+  Action action = static_cast<Action>(instructions[0][0]);
+  if (action == Action::PLACE) {
     Order order = Order(
       static_cast<OrderId>(std::stoi(instructions[1])),
       static_cast<Symbol>(instructions[2]),
@@ -251,43 +259,46 @@ results_t SimpleCross::action(const std::string line) {
       static_cast<Quantity>(std::stoi(instructions[4])),
       static_cast<Price>(std::stod(instructions[5]))
     );
-    _placeOrder(order);
-    _printSortedBook();
-  } else if (instructions[0] == "X") {
-    _cancelOrder(
+    std::vector<Fill> fills = _placeOrder(order);
+    _printFills(fills);
+  } else if (action == Action::CANCEL) {
+    bool cancelled = _cancelOrder(
       static_cast<OrderId>(std::stoi(instructions[1]))
     );
-    _printSortedBook();
-  } else if (instructions[0] == "P") {
+    _printCancel(static_cast<OrderId>(std::stoi(instructions[1])), cancelled);
+  } else if (action == Action::PRINT) {
     _printSortedBook();
   }
+
+  if (debug) _logSortedBook();
 
   return results_t();
 }
 
 //----------------------------------------------------------------------------------------------------------------------
-void SimpleCross::_placeOrder(Order &order) {
+std::vector<Fill> SimpleCross::_placeOrder(Order &order) {
   _validateOrderId(order.oid);
+
+  std::vector<Fill> fills;
+
   // Note: In a real system, all the traded symbols would probably be loaded on startup,
   //       but given the problem constraints, we will generate the book on the fly
   if (orderBook.find(order.symbol) == orderBook.end()) {
     _placeOrderNewSymbol(order);
   } else {
-    _placeOrderExistingSymbol(order);
+    fills = _placeOrderExistingSymbol(order);
   }
 
   if (order.qty != 0) {
     orderCache.insert(std::pair<OrderId, Order>(order.oid, order));
   }
+
+  return fills;
 }
 
 //----------------------------------------------------------------------------------------------------------------------
 void SimpleCross::_placeOrderNewSymbol(Order &order) {
-  _log("------------------------------------------------------------");
-  _log("Symbol not in book!");
-  _log("New order id : " + std::to_string(order.oid));
-  _log("New order px : " + std::to_string(order.px));
-  _log("New order qty: " + std::to_string(order.qty));
+  _log("Symbol " + order.symbol + " not in book. Adding it now.");
   // Create Order Queue
   OrderQueue orderQueue;
   orderQueue.emplace_back(order);
@@ -308,16 +319,11 @@ void SimpleCross::_placeOrderNewSymbol(Order &order) {
 }
 
 //----------------------------------------------------------------------------------------------------------------------
-void SimpleCross::_placeOrderExistingSymbol(Order &order) {
-  _log("------------------------------------------------------------");
+std::vector<Fill> SimpleCross::_placeOrderExistingSymbol(Order &order) {
   _log("Symbol found!");
 
   // First attempt to fill order
-  _fillOrder(order);
-
-  _log("New order id : " + std::to_string(order.oid));
-  _log("New order px : " + std::to_string(order.px));
-  _log("New order qty: " + std::to_string(order.qty));
+  std::vector<Fill> fills = _fillOrder(order);
 
   if (order.qty != 0) { // order was not completely filled
     PriceLevels& pxLevels = order.side == Side::BUY
@@ -334,13 +340,20 @@ void SimpleCross::_placeOrderExistingSymbol(Order &order) {
       pxLevels[order.px].emplace_back(order);
     }
   }
+
+  return fills;
 }
 
 //----------------------------------------------------------------------------------------------------------------------
-void SimpleCross::_cancelOrder(OrderId oid) {
+bool SimpleCross::_cancelOrder(OrderId oid) {
   _log("Cancelling order: " + std::to_string(oid));
 
-  Order& order = orderCache.at(oid);
+  Order order;
+  try {
+    order = orderCache.at(oid);
+  } catch (const std::out_of_range& oor) {
+    return false;
+  }
 
   PriceLevels& pxLevels = order.side == Side::BUY
     ? orderBook[order.symbol].bids
@@ -360,24 +373,30 @@ void SimpleCross::_cancelOrder(OrderId oid) {
   if (orderQueue.empty()) {
     pxLevels.erase(order.px);
   }
-  
+
+  return true;
 }
 
 /*---------------------------------------------------------------------------------------------------------------------
 // Attempt to fill order in place. qty in out paramater, order, will be the remaining unfilled shares
 // TODO: The buy and ask branches are similar. Could potentially generalize with templates
 //---------------------------------------------------------------------------------------------------------------------*/
-void SimpleCross::_fillOrder(Order &order) {
+std::vector<Fill> SimpleCross::_fillOrder(Order &order) {
   if (order.side == Side::BUY) {
-    _fillBid(order);
+    return _fillBid(order);
   } else if (order.side == Side::SELL) {
-    _fillAsk(order);
+    return _fillAsk(order);
   }
+
+  return std::vector<Fill>();
 }
 
 //----------------------------------------------------------------------------------------------------------------------
-void SimpleCross::_fillBid(Order &order) {
+std::vector<Fill> SimpleCross::_fillBid(Order &order) {
   _log("Attempting to fill bid!");
+
+  std::vector<Fill> fills;
+
   // Already know symbol is in orderBook from calling function
   PriceLevels& askPxLevels = orderBook[order.symbol].asks;
   std::vector<Price> pxLevelsToDrop = {};
@@ -393,6 +412,17 @@ void SimpleCross::_fillBid(Order &order) {
         order.qty -= sharesExecuted;
         restingOrder.qty -= sharesExecuted;
 
+        if (sharesExecuted > 0) {
+          _log("Crossed " + std::to_string(sharesExecuted) + " shared with order " + std::to_string(restingOrder.oid));
+        
+          Fill fill;
+          fill.oid = restingOrder.oid;
+          fill.symbol = restingOrder.symbol;
+          fill.qty = sharesExecuted;
+          fill.px = restingOrder.px;
+          fills.push_back(fill);
+        }
+
         if (restingOrder.qty == 0) ordersToPop++;
         if (order.qty == 0) break;
       }
@@ -407,11 +437,16 @@ void SimpleCross::_fillBid(Order &order) {
 
   // Clear price levels for which there are no longer resting orders
   for (Price px : pxLevelsToDrop) askPxLevels.erase(px);
+
+  return fills;
 }
 
 //----------------------------------------------------------------------------------------------------------------------
-void SimpleCross::_fillAsk(Order &order) {
+std::vector<Fill> SimpleCross::_fillAsk(Order &order) {
   _log("Attempting to fill ask!");
+
+  std::vector<Fill> fills;
+
   // Already know symbol is in orderBook from calling function
   PriceLevels& bidPxLevels = orderBook[order.symbol].bids;
   std::vector<Price> pxLevelsToDrop = {};
@@ -429,6 +464,17 @@ void SimpleCross::_fillAsk(Order &order) {
         order.qty -= sharesExecuted;
         restingOrder.qty -= sharesExecuted;
 
+        if (sharesExecuted > 0) {
+          _log("Crossed " + std::to_string(sharesExecuted) + " with order " + std::to_string(restingOrder.oid));
+        
+          Fill fill;
+          fill.oid = restingOrder.oid;
+          fill.symbol = restingOrder.symbol;
+          fill.qty = sharesExecuted;
+          fill.px = restingOrder.px;
+          fills.push_back(fill);
+        }
+
         if (restingOrder.qty == 0) ordersToPop++;
         if (order.qty == 0) break;
       }
@@ -443,6 +489,8 @@ void SimpleCross::_fillAsk(Order &order) {
 
   // Clear price levels for which there are no longer resting orders
   for (Price px : pxLevelsToDrop) bidPxLevels.erase(px);
+
+  return fills;
 }
 
 //----------------------------------------------------------------------------------------------------------------------
@@ -450,6 +498,67 @@ void SimpleCross::_validateOrderId(const OrderId orderId) {
   for (std::pair<OrderId, Order> cachedOrder : orderCache) {
     if (cachedOrder.first == orderId) {
       throw std::invalid_argument("Invalid Order ID");
+    }
+  }
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+void SimpleCross::_printFills(std::vector<Fill> fills) {
+  for (Fill fill : fills) {
+    log("F "
+      + std::to_string(fill.oid) + " "
+      + fill.symbol + " "
+      + std::to_string(fill.qty) + " "
+      + std::to_string(fill.px)
+    );
+  }
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+void SimpleCross::_printCancel(OrderId oid, bool cancelled) {
+  if (cancelled) {
+    log("X " + std::to_string(oid));
+  } else {
+    log("E " + std::to_string(oid) + " Order ID not on book");
+  }
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+void SimpleCross::_printSortedBook() {
+  if (orderBook.empty()) {
+    log("Book empty!");
+    return;
+  }
+
+  for (std::pair<Symbol, Sides> symbolSides : orderBook) {
+    Symbol symbol = symbolSides.first;
+
+    Side side = Side::SELL;
+    for (auto pxLevelIt = symbolSides.second.asks.rbegin(); pxLevelIt != symbolSides.second.asks.rend(); ++pxLevelIt) {
+      Price price = pxLevelIt->first;
+      for (Order order : pxLevelIt->second) {
+        log("P "
+          + std::to_string(order.oid) + " "
+          + symbol + " "
+          + std::string(1, side) + " "
+          + std::to_string(order.qty) + " "
+          + std::to_string(price)
+        );
+      }
+    }
+
+    side = Side::BUY;
+    for (auto pxLevelIt = symbolSides.second.bids.rbegin(); pxLevelIt != symbolSides.second.bids.rend(); ++pxLevelIt) {
+      Price price = pxLevelIt->first;
+      for (Order order : pxLevelIt->second) {
+        log("P "
+          + std::to_string(order.oid) + " "
+          + symbol + " "
+          + std::string(1, side) + " "
+          + std::to_string(order.qty) + " "
+          + std::to_string(price)
+        );
+      }
     }
   }
 }
@@ -469,7 +578,7 @@ std::vector<std::string> SimpleCross::_splitLine(const std::string line, const c
 }
 
 //----------------------------------------------------------------------------------------------------------------------
-void SimpleCross::_printSortedBook() {
+void SimpleCross::_logSortedBook() {
   if (orderBook.empty()) {
     log("Book empty!");
     return;
@@ -514,7 +623,7 @@ void SimpleCross::_printSortedBook() {
 int main(int argc, char **argv) {
     SimpleCross scross;
     std::string line;
-    std::ifstream actions("actions.txt", std::ios::in);
+    std::ifstream actions("./tests/actions.txt", std::ios::in);
     while (std::getline(actions, line)) {
         results_t results = scross.action(line);
         for (results_t::const_iterator it=results.begin(); it!=results.end(); ++it) {
